@@ -1,13 +1,11 @@
 // ==UserScript==
-// @name         Remove Adblock Thing
+// @name         Remove Adblock Thing (Playlist Fix)
 // @namespace    http://tampermonkey.net/
-// @version      6.0
-// @description  Removes Adblock Thing
+// @version      6.0.1
+// @description  Removes Adblock Thing - fixed for SPA playlist navigation (no reload-loop on 2nd video)
 // @author       JoelMatic
 // @match        https://www.youtube.com/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
-// @updateURL    https://github.com/TheRealJoelmatic/RemoveAdblockThing/raw/main/Youtube-Ad-blocker-Reminder-Remover.user.js
-// @downloadURL  https://github.com/TheRealJoelmatic/RemoveAdblockThing/raw/main/Youtube-Ad-blocker-Reminder-Remover.user.js
 // @run-at       document-start
 // @inject-into  page
 // @grant        none
@@ -25,12 +23,14 @@
     const adblocker = true;
 
 
-    // Enable The Popup remover (pointless if you have the Undetected Adblocker)
-    const removePopup = false;
+    // Enable The Popup remover
+    // NOTE: must be true together with adblocker, otherwise YouTube's enforcement
+    // popup appears on later playlist videos with nothing to dismiss it.
+    const removePopup = true;
 
 
     // Checks for updates (Removes the popup)
-    const updateCheck = true;
+    const updateCheck = false;
 
 
     // Enable debug messages into the console
@@ -46,30 +46,38 @@
     };
 
 
-
-
     //
     //      CODE
     //
-    // If you have any suggestions, bug reports,
-    // or want to contribute to this userscript,
-    // feel free to create issues or pull requests in the GitHub repository.
-    //
-    // GITHUB: https://github.com/TheRealJoelmatic/RemoveAdblockThing
 
 
     //
-    // Varables used for adblock
+    // Variables used for adblock
     //
 
 
-    // Store the initial URL
-    let currentUrl = window.location.href;
+    // Identity of the current video (video id + playlist id), not the raw URL.
+    // YouTube rewrites t=, pp=, index=, list= on the SAME video constantly; comparing
+    // the raw href made every playlist step look like a page change.
+    const videoKey = () => {
+        try {
+            const p = new URLSearchParams(location.search);
+            return (p.get('v') || '') + '|' + (p.get('list') || '');
+        } catch (e) {
+            return location.href;
+        }
+    };
 
+    let currentKey = videoKey();
 
     // Used to stop reload spam
     let isReloading = false;
 
+    // Timestamp of the last forced reload, to debounce burst navigations
+    let lastReloadAt = 0;
+
+    // Pending check timers, so bursts of events collapse into one check
+    let checkTimer = 0;
 
     //
     // Variables used for updater
@@ -84,7 +92,6 @@
     //
 
 
-    //Set everything up here
     log("Script started");
 
 
@@ -93,61 +100,44 @@
     if (updateCheck) checkForUpdate();
 
 
-    // Remove Them pesski popups
+    // Remove YouTube's adblock enforcement popup (only when present)
     function popupRemover() {
-
+        let lastPlayAt = 0;
 
         setInterval(() => {
-            const modalOverlay = document.querySelector("tp-yt-iron-overlay-backdrop");
-            const popup = document.querySelector(".style-scope ytd-enforcement-message-view-model");
+            const video = document.querySelector('video');
+            if (!video) return;
+
+            const overlay = document.querySelector('tp-yt-iron-overlay-backdrop');
+            const popup = document.querySelector("ytd-enforcement-message-view-model, .style-scope.ytd-enforcement-message-view-model");
             const popupButton = document.getElementById("dismiss-button");
 
+            // Nothing blocking -> do not touch the player (never steal pause/seek)
+            if (!popup && !(overlay && overlay.hasAttribute('opened'))) return;
 
-            var video = document.querySelector('video');
+            log("Popup detected, removing...");
 
+            if (popupButton) popupButton.click();
 
-            const bodyStyle = document.body.style;
-            bodyStyle.setProperty('overflow-y', 'auto', 'important');
-
-
-            if (modalOverlay) {
-                modalOverlay.removeAttribute("opened");
-                modalOverlay.remove();
+            if (popup) popup.remove();
+            if (overlay) {
+                overlay.removeAttribute("opened");
+                overlay.remove();
             }
 
+            document.body.style.setProperty('overflow-y', 'auto', 'important');
 
-            if (popup) {
-                log("Popup detected, removing...");
-
-
-                if(popupButton) popupButton.click();
-
-
-                popup.remove();
-                if (video) video.play();
-
-
-                setTimeout(() => {
-                    if (video) video.play();
-                }, 500);
-
-
-                    log("Popup removed");
+            if (Date.now() - lastPlayAt > 1000) {
+                lastPlayAt = Date.now();
+                const p = video.play();
+                if (p && typeof p.catch === 'function') p.catch(() => {});
             }
 
-
-            if (!video) return;
-            // Check if the video is paused after removing the popup
-            if (!video.paused) return;
-            // UnPause The Video
-            video.play();
-
-
+            log("Popup removed");
         }, 1000);
     }
 
 
-    // undetected adblocker method
     // undetected adblocker method
     function removeAds() {
         log("removeAds()");
@@ -156,18 +146,19 @@
         setGoogleAdStatus("startup");
 
 
+        // Configurable so the SPA can be re-instrumented and so descriptors stay
+        // native-looking; the getter always answers 1.
         try {
             Object.defineProperty(window, 'google_ad_status', {
-                configurable: false,
+                configurable: true,
                 enumerable: true,
                 get() {
                     return 1;
                 },
                 set(value) {
-                    log("Blocked google_ad_status overwrite: " + value + " -> 1");
+                    // accepted, but reads still report 1
                 }
             });
-
 
             log("google_ad_status lock installed");
         } catch (error) {
@@ -183,7 +174,7 @@
             checkUrlChange("interval check");
             setGoogleAdStatus("interval keep alive");
             removePageAds();
-        }, 500);
+        }, 1000);
 
 
         removePageAds();
@@ -191,7 +182,7 @@
 
 
     //
-    // logic functionm
+    // logic functions
     //
 
 
@@ -206,27 +197,56 @@
 
 
     function forceRefresh(reason) {
-        if (isReloading) {
-            return;
-        }
-
+        if (isReloading) return;
 
         isReloading = true;
         setGoogleAdStatus("before forced refresh");
 
-
         log("URL changed, forcing full refresh (" + reason + ")");
-
 
         window.location.reload();
     }
 
 
     function checkUrlChange(reason) {
-        if (window.location.href !== currentUrl) {
-            currentUrl = window.location.href;
-            forceRefresh(reason);
+        const key = videoKey();
+
+        // Same video (only t=/pp=/index= churn) -> nothing to do
+        if (key === currentKey) return;
+
+        currentKey = key;
+
+        // Inside a playlist YouTube already swapped the player via SPA.
+        // Reloading here is what caused the endless refresh on the 2nd video.
+        if (location.pathname === '/watch' && new URLSearchParams(location.search).has('list')) {
+            log("Playlist video switch, staying on SPA (" + reason + ")");
+            setGoogleAdStatus(reason);
+            removePageAds();
+            return;
         }
+
+        if (!/^\/watch/.test(location.pathname)) {
+            // Regular navigation between non-watch pages: no reload needed
+            setGoogleAdStatus(reason);
+            return;
+        }
+
+        if (Date.now() - lastReloadAt < 5000) {
+            log("Reload suppressed (debounce) (" + reason + ")");
+            return;
+        }
+
+        lastReloadAt = Date.now();
+        forceRefresh(reason);
+    }
+
+
+    function scheduleCheck(reason) {
+        if (checkTimer) return;
+        checkTimer = setTimeout(() => {
+            checkTimer = 0;
+            checkUrlChange(reason);
+        }, 250);
     }
 
 
@@ -239,9 +259,7 @@
             const result = originalPushState.apply(this, args);
 
 
-            setTimeout(() => {
-                checkUrlChange("history.pushState");
-            }, 0);
+            scheduleCheck("history.pushState");
 
 
             return result;
@@ -256,9 +274,7 @@
             const result = originalReplaceState.apply(this, args);
 
 
-            setTimeout(() => {
-                checkUrlChange("history.replaceState");
-            }, 0);
+            scheduleCheck("history.replaceState");
 
 
             return result;
@@ -267,34 +283,23 @@
 
         window.addEventListener('popstate', () => {
             setGoogleAdStatus("popstate");
-            setTimeout(() => {
-                checkUrlChange("popstate");
-            }, 0);
+            scheduleCheck("popstate");
         }, true);
 
 
         document.addEventListener('yt-navigate-start', () => {
             setGoogleAdStatus("yt-navigate-start");
-            setTimeout(() => {
-                checkUrlChange("yt-navigate-start");
-            }, 0);
+            scheduleCheck("yt-navigate-start");
         }, true);
 
 
         document.addEventListener('yt-navigate-finish', () => {
             setGoogleAdStatus("yt-navigate-finish");
-            setTimeout(() => {
-                checkUrlChange("yt-navigate-finish");
-            }, 0);
+            scheduleCheck("yt-navigate-finish");
         }, true);
 
-
-        document.addEventListener('yt-page-data-updated', () => {
-            setGoogleAdStatus("yt-page-data-updated");
-            setTimeout(() => {
-                checkUrlChange("yt-page-data-updated");
-            }, 0);
-        }, true);
+        // yt-page-data-updated intentionally NOT hooked: it fires many times per
+        // video (metadata, comments, chat) and caused spurious reloads.
 
 
         log("URL change hooks installed");
@@ -335,7 +340,6 @@
             ad-slot-renderer,
             ytm-promoted-sparkles-web-renderer,
             masthead-ad,
-            tp-yt-iron-overlay-backdrop,
 
 
             #masthead-ad {
@@ -344,7 +348,7 @@
             `;
 
 
-            document.head.appendChild(style);
+            (document.head || document.documentElement).appendChild(style);
         }
 
 
@@ -360,12 +364,14 @@
         });
 
 
-        log("Removed page ads (✔️)");
+        if (document.querySelector("ytd-ad-slot-renderer, ytd-in-feed-ad-layout-renderer, div#player-ads")) {
+            log("Removed page ads (✔️)");
+        }
     }
 
 
     //
-    // Update check
+    // Update check (disabled by default in this fixed build; kept intact)
     //
 
 
